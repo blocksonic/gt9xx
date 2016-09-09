@@ -700,8 +700,8 @@ static void goodix_read_config(struct goodix_ts_data *ts)
 	ts->int_trigger_type = config[TRIGGER_LOC] & 0x03;
 	ts->max_touch_num = config[MAX_CONTACTS_LOC] & 0x0f;
 
-	dev_info(&ts->client->dev, "dev_info: cfg_len: %d, x_max: %d, y_max: %d, touch_num: %d \n", ts->cfg_len, ts->abs_x_max,
-		ts->abs_x_max, ts->max_touch_num);			//bsb ;
+	dev_info(&ts->client->dev, "dev_info: cfg_len: %d, x_max: %d, y_max: %d, touch_num: %d, trigger_type: %d \n", ts->cfg_len, ts->abs_x_max,
+		ts->abs_x_max, ts->max_touch_num, ts->int_trigger_type);			//bsb ;
 
 	if (!ts->abs_x_max || !ts->abs_y_max || !ts->max_touch_num) {
 		dev_err(&ts->client->dev,
@@ -721,8 +721,8 @@ static void goodix_read_config(struct goodix_ts_data *ts)
 			 "Applying '180 degrees rotated screen' quirk\n");
 	}
 
-	dev_info(&ts->client->dev, "dev_info: cfg_len: %d, x_max: %d, y_max: %d, touch_num: %d \n", ts->cfg_len, ts->abs_x_max,
-		ts->abs_x_max, ts->max_touch_num);			//bsb ;
+	dev_info(&ts->client->dev, "dev_info: cfg_len: %d, x_max: %d, y_max: %d, touch_num: %d, trigger_type: %d \n", ts->cfg_len, ts->abs_x_max,
+		ts->abs_x_max, ts->max_touch_num, ts->int_trigger_type);			//bsb ;
 }
 
 /**
