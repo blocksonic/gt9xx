@@ -65,12 +65,12 @@ struct goodix_ts_data {
 /* Chuwi Hi12 tablet screen max is 2160 x 1440 and the Chuwi Hi10 is 1920 x 1200 */
 /* lowered defaults for testing on Chuwi tablets */
 // #define GOODIX_MAX_HEIGHT		4096
-#define GOODIX_MAX_HEIGHT		1920
+#define GOODIX_MAX_HEIGHT		2160
 // #define GOODIX_MAX_WIDTH		4096
-#define GOODIX_MAX_WIDTH		1200
+#define GOODIX_MAX_WIDTH		2160
 #define GOODIX_INT_TRIGGER		1
 #define GOODIX_CONTACT_SIZE		8
-//#define GOODIX_MAX_CONTACTS		10
+// #define GOODIX_MAX_CONTACTS		10
 #define GOODIX_MAX_CONTACTS		5
 
 #define GOODIX_CONFIG_MAX_LENGTH	240
@@ -700,7 +700,7 @@ static void goodix_read_config(struct goodix_ts_data *ts)
 	ts->int_trigger_type = config[TRIGGER_LOC] & 0x03;
 	ts->max_touch_num = config[MAX_CONTACTS_LOC] & 0x0f;
 
-	dev_info(&ts->client->dev, "bsb_di 20160908; cfg_len: %d, x_max: %d, y_max: %d, touch_num: %d \n", ts->cfg_len, ts->abs_x_max,
+	dev_info(&ts->client->dev, "dev_info: cfg_len: %d, x_max: %d, y_max: %d, touch_num: %d \n", ts->cfg_len, ts->abs_x_max,
 		ts->abs_x_max, ts->max_touch_num);			//bsb ;
 
 	if (!ts->abs_x_max || !ts->abs_y_max || !ts->max_touch_num) {
@@ -720,6 +720,9 @@ static void goodix_read_config(struct goodix_ts_data *ts)
 		dev_dbg(&ts->client->dev,
 			 "Applying '180 degrees rotated screen' quirk\n");
 	}
+
+	dev_info(&ts->client->dev, "dev_info: cfg_len: %d, x_max: %d, y_max: %d, touch_num: %d \n", ts->cfg_len, ts->abs_x_max,
+		ts->abs_x_max, ts->max_touch_num);			//bsb ;
 }
 
 /**
