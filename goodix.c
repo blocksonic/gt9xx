@@ -15,6 +15,8 @@
  * Software Foundation; version 2 of the License.
  */
 
+#define DEBUG
+
 #include <linux/kernel.h>
 #include <linux/dmi.h>
 #include <linux/firmware.h>
@@ -119,6 +121,23 @@ static const struct dmi_system_id rotated_screen[] = {
 			DMI_MATCH(DMI_SYS_VENDOR, "WinBook"),
 			DMI_MATCH(DMI_PRODUCT_NAME, "TW700")
 		},
+	},
+#endif
+	{}
+};
+
+/*
+ * Some platforms specify the gpio pins for interrupt and reset properly
+ * in ACPI, but do not describe them using _DSD properties.
+ */
+static const struct dmi_system_id goodix_gpios_int_first_support[] = {
+#if defined(CONFIG_DMI) && defined(CONFIG_X86)
+	{
+		.ident = "Chuwi Hi12",
+		.matches = {
+			DMI_MATCH(DMI_BOARD_VENDOR, "Hampoo"),
+			DMI_MATCH(DMI_BOARD_NAME, "Cherry Trail CR")
+		}
 	},
 #endif
 	{}
@@ -625,6 +644,15 @@ static void goodix_close(struct input_dev *input_dev)
 	atomic_dec(&ts->open_count);
 }
 
+static const struct acpi_gpio_params goodix_first_gpio = { 0, 0, false };
+static const struct acpi_gpio_params goodix_second_gpio = { 1, 0, false };
+
+static const struct acpi_gpio_mapping goodix_gpios_int_first[] = {
+	{ GOODIX_GPIO_INT_NAME "-gpio", &goodix_first_gpio, 1 },
+	{ GOODIX_GPIO_RST_NAME "-gpio", &goodix_second_gpio, 1 },
+	{ },
+};
+
 /**
  * goodix_get_gpio_config - Get GPIO config from ACPI/DT
  *
@@ -640,6 +668,15 @@ static int goodix_get_gpio_config(struct goodix_ts_data *ts)
 		return -EINVAL;
 	dev = &ts->client->dev;
 
+	if (dmi_check_system(goodix_gpios_int_first_support) &&
+	    ACPI_HANDLE(dev)) {
+		error = acpi_dev_add_driver_gpios(ACPI_COMPANION(dev),
+						  goodix_gpios_int_first);
+		if (error)
+			return error;
+		dev_dbg(&ts->client->dev, "Applying gpios quirk\n");
+	}
+
 	/* Get the interrupt GPIO pin number */
 	gpiod = devm_gpiod_get_optional(dev, GOODIX_GPIO_INT_NAME, GPIOD_IN);
 	if (IS_ERR(gpiod)) {
@@ -647,7 +684,7 @@ static int goodix_get_gpio_config(struct goodix_ts_data *ts)
 		if (error != -EPROBE_DEFER)
 			dev_dbg(dev, "Failed to get %s GPIO: %d\n",
 				GOODIX_GPIO_INT_NAME, error);
-		return error;
+		goto out_err;
 	}
 	ts->gpiod_int = gpiod;
 
@@ -658,11 +695,16 @@ static int goodix_get_gpio_config(struct goodix_ts_data *ts)
 		if (error != -EPROBE_DEFER)
 			dev_dbg(dev, "Failed to get %s GPIO: %d\n",
 				GOODIX_GPIO_RST_NAME, error);
-		return error;
+		goto out_err;
 	}
 	ts->gpiod_rst = gpiod;
 
 	return 0;
+
+out_err:
+	if (ACPI_HANDLE(dev))
+		acpi_dev_remove_driver_gpios(ACPI_COMPANION(dev));
+	return error;
 }
 
 /**
@@ -1021,6 +1063,8 @@ static int goodix_ts_remove(struct i2c_client *client)
 
 	sysfs_remove_group(&client->dev.kobj, &goodix_attr_group);
 	goodix_disable_esd(ts);
+	if (ACPI_HANDLE(&ts->client->dev))
+		acpi_dev_remove_driver_gpios(ACPI_COMPANION(&ts->client->dev));
 	kfree(ts->cfg_name);
 
 	return 0;
