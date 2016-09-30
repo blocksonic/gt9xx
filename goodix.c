@@ -20,7 +20,7 @@
 #include <linux/kernel.h>
 #include <linux/dmi.h>
 #include <linux/firmware.h>
-#include <linux/gpio.h>
+#include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/input.h>
 #include <linux/input/mt.h>
@@ -39,6 +39,9 @@ struct goodix_ts_data {
 	struct input_dev *input_dev;
 	int abs_x_max;
 	int abs_y_max;
+	bool swapped_x_y;
+	bool inverted_x;
+	bool inverted_y;
 	unsigned int max_touch_num;
 	unsigned int int_trigger_type;
 	int cfg_len;
@@ -46,7 +49,7 @@ struct goodix_ts_data {
 	struct gpio_desc *gpiod_rst;
 	u16 id;
 	u16 version;
-	char *cfg_name;
+	const char *cfg_name;
 	struct completion firmware_loading_complete;
 	unsigned long irq_flags;
 	atomic_t esd_timeout;
@@ -55,23 +58,15 @@ struct goodix_ts_data {
 	atomic_t open_count;
 	/* Protects power management calls and access to suspended flag */
 	struct mutex mutex;
-	bool swapped_x_y;
-	bool inverted_x;
-	bool inverted_y;
 };
 
 #define GOODIX_GPIO_INT_NAME		"irq"
 #define GOODIX_GPIO_RST_NAME		"reset"
 #define GOODIX_DEVICE_ESD_TIMEOUT_PROPERTY     "esd-recovery-timeout-ms"
 
-/* Chuwi Hi12 tablet screen max is 2160 x 1440 and the Chuwi Hi10 is 1920 x 1200 */
-/* lowered defaults for testing on Chuwi tablets */
-// #define GOODIX_MAX_HEIGHT		4096
-#define GOODIX_MAX_HEIGHT		2160
-// #define GOODIX_MAX_WIDTH		4096
-#define GOODIX_MAX_WIDTH		2160
-// #define GOODIX_INT_TRIGGER		1
-#define GOODIX_INT_TRIGGER		0
+#define GOODIX_MAX_HEIGHT		4096
+#define GOODIX_MAX_WIDTH		4096
+#define GOODIX_INT_TRIGGER		1
 #define GOODIX_CONTACT_SIZE		8
 #define GOODIX_MAX_CONTACTS		10
 
@@ -213,16 +208,19 @@ static int goodix_i2c_write_u8(struct i2c_client *client, u16 reg, u8 value)
 static int goodix_get_cfg_len(u16 id)
 {
 	switch (id) {
-	case 9111:
+	case 9111: 		// Chuwi Hi12
 	case 911:
 	case 9271:
 	case 9110:
+	case 9157:
 	case 927:
 	case 928:
 		return GOODIX_CONFIG_911_LENGTH;
+
 	case 912:
 	case 967:
 		return GOODIX_CONFIG_967_LENGTH;
+
 	default:
 		return GOODIX_CONFIG_MAX_LENGTH;
 	}
@@ -437,9 +435,14 @@ static int goodix_int_sync(struct goodix_ts_data *ts)
 	error = gpiod_direction_output(ts->gpiod_int, 0);
 	if (error)
 		return error;
+
 	msleep(50);				/* T5: 50ms */
 
-	return gpiod_direction_input(ts->gpiod_int);
+	error = gpiod_direction_input(ts->gpiod_int);
+	if (error)
+		return error;
+
+	return 0;
 }
 
 /**
@@ -455,21 +458,60 @@ static int goodix_reset(struct goodix_ts_data *ts)
 	error = gpiod_direction_output(ts->gpiod_rst, 0);
 	if (error)
 		return error;
+
 	msleep(20);				/* T2: > 10ms */
+
 	/* HIGH: 0x28/0x29, LOW: 0xBA/0xBB */
 	error = gpiod_direction_output(ts->gpiod_int, ts->client->addr == 0x14);
 	if (error)
 		return error;
+
 	usleep_range(100, 2000);		/* T3: > 100us */
+
 	error = gpiod_direction_output(ts->gpiod_rst, 1);
 	if (error)
 		return error;
+
 	usleep_range(6000, 10000);		/* T4: > 5ms */
+
 	/* end select I2C slave addr */
-	error = gpiod_direction_input(ts->gpiod_rst);
+	error = goodix_int_sync(ts);
 	if (error)
 		return error;
-	return goodix_int_sync(ts);
+
+	return 0;
+}
+
+static ssize_t goodix_dump_config_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct goodix_ts_data *ts = dev_get_drvdata(dev);
+	u8 config[GOODIX_CONFIG_MAX_LENGTH];
+	int error, count = 0, i;
+
+	if (ts->gpiod_int && ts->gpiod_rst) {
+		wait_for_completion(&ts->firmware_loading_complete);
+
+		error = goodix_set_power_state(ts, true);
+		if (error)
+			return error;
+	}
+
+	error = goodix_i2c_read(ts->client, GOODIX_REG_CONFIG_DATA,
+				config, ts->cfg_len);
+	if (error) {
+		dev_warn(&ts->client->dev,
+			 "Error reading config (%d)\n",  error);
+		return error;
+	}
+
+	if (ts->gpiod_int && ts->gpiod_rst)
+		goodix_set_power_state(ts, false);
+
+	for (i = 0; i < ts->cfg_len; i++)
+		count += scnprintf(buf + count, PAGE_SIZE - count, "%02x ",
+				   config[i]);
+	return count;
 }
 
 static void goodix_disable_esd(struct goodix_ts_data *ts)
@@ -574,46 +616,27 @@ static ssize_t goodix_esd_timeout_store(struct device *dev,
 	return count;
 }
 
-static ssize_t goodix_dump_config_show(struct device *dev,
-				       struct device_attribute *attr, char *buf)
-{
-	struct goodix_ts_data *ts = dev_get_drvdata(dev);
-	u8 config[GOODIX_CONFIG_MAX_LENGTH];
-	int error, count = 0, i;
-
-	error = goodix_set_power_state(ts, true);
-	if (error)
-		return error;
-	error = goodix_i2c_read(ts->client, GOODIX_REG_CONFIG_DATA,
-				config, ts->cfg_len);
-	if (error) {
-		dev_warn(&ts->client->dev,
-			 "Error reading config (%d)\n",  error);
-		goodix_set_power_state(ts, false);
-		return error;
-	}
-	goodix_set_power_state(ts, false);
-
-	for (i = 0; i < ts->cfg_len; i++)
-		count += scnprintf(buf + count, PAGE_SIZE - count, "%02x ",
-				   config[i]);
-
-	return count;
-}
-
+static DEVICE_ATTR(dump_config, S_IRUGO, goodix_dump_config_show, NULL);
 /* ESD timeout in ms. Default disabled (0). Recommended 2000 ms. */
 static DEVICE_ATTR(esd_timeout, S_IRUGO | S_IWUSR, goodix_esd_timeout_show,
 		   goodix_esd_timeout_store);
-static DEVICE_ATTR(dump_config, S_IRUGO, goodix_dump_config_show, NULL);
 
 static struct attribute *goodix_attrs[] = {
-	&dev_attr_esd_timeout.attr,
 	&dev_attr_dump_config.attr,
 	NULL
 };
 
 static const struct attribute_group goodix_attr_group = {
 	.attrs = goodix_attrs,
+};
+
+static struct attribute *goodix_gpio_attrs[] = {
+	&dev_attr_esd_timeout.attr,
+	NULL
+};
+
+static const struct attribute_group goodix_gpio_attr_group = {
+	.attrs = goodix_gpio_attrs,
 };
 
 static int goodix_open(struct input_dev *input_dev)
@@ -686,6 +709,7 @@ static int goodix_get_gpio_config(struct goodix_ts_data *ts)
 				GOODIX_GPIO_INT_NAME, error);
 		goto out_err;
 	}
+
 	ts->gpiod_int = gpiod;
 
 	/* Get the reset line GPIO pin number */
@@ -697,6 +721,7 @@ static int goodix_get_gpio_config(struct goodix_ts_data *ts)
 				GOODIX_GPIO_RST_NAME, error);
 		goto out_err;
 	}
+
 	ts->gpiod_rst = gpiod;
 
 	return 0;
@@ -721,7 +746,6 @@ static void goodix_read_config(struct goodix_ts_data *ts)
 
 	error = goodix_i2c_read(ts->client, GOODIX_REG_CONFIG_DATA,
 				config, ts->cfg_len);
-
 	if (error) {
 		dev_warn(&ts->client->dev,
 			 "Error reading config (%d), using defaults\n",
@@ -742,9 +766,6 @@ static void goodix_read_config(struct goodix_ts_data *ts)
 	ts->int_trigger_type = config[TRIGGER_LOC] & 0x03;
 	ts->max_touch_num = config[MAX_CONTACTS_LOC] & 0x0f;
 
-	dev_info(&ts->client->dev, "dev_info: cfg_len: %d, x_max: %d, y_max: %d, touch_num: %d, trigger_type: %d \n", ts->cfg_len, ts->abs_x_max,
-		ts->abs_x_max, ts->max_touch_num, ts->int_trigger_type);			//bsb ;
-
 	if (!ts->abs_x_max || !ts->abs_y_max || !ts->max_touch_num) {
 		dev_err(&ts->client->dev,
 			"Invalid config, using defaults\n");
@@ -752,7 +773,7 @@ static void goodix_read_config(struct goodix_ts_data *ts)
 		ts->abs_y_max = GOODIX_MAX_HEIGHT;
 		if (ts->swapped_x_y)
 			swap(ts->abs_x_max, ts->abs_y_max);
-		ts->int_trigger_type = GOODIX_INT_TRIGGER; //bsb; 'error reading config' above called this, so assuming it needs to be set
+		ts->int_trigger_type = GOODIX_INT_TRIGGER;	//bsb 
 		ts->max_touch_num = GOODIX_MAX_CONTACTS;
 	}
 
@@ -763,8 +784,8 @@ static void goodix_read_config(struct goodix_ts_data *ts)
 			 "Applying '180 degrees rotated screen' quirk\n");
 	}
 
-	dev_info(&ts->client->dev, "dev_info: cfg_len: %d, x_max: %d, y_max: %d, touch_num: %d, trigger_type: %d \n", ts->cfg_len, ts->abs_x_max,
-		ts->abs_x_max, ts->max_touch_num, ts->int_trigger_type);			//bsb ;
+	dev_dbg(&ts->client->dev, "dev_info: cfg_len: %d, x_max: %d, y_max: %d, touch_num: %d, trigger_type: %d \n", ts->cfg_len, ts->abs_x_max,
+		ts->abs_x_max, ts->max_touch_num, ts->int_trigger_type);	//bsb
 }
 
 /**
@@ -917,7 +938,7 @@ static int goodix_configure_dev(struct goodix_ts_data *ts)
  */
 static void goodix_config_cb(const struct firmware *cfg, void *ctx)
 {
-	struct goodix_ts_data *ts = (struct goodix_ts_data *)ctx;
+	struct goodix_ts_data *ts = ctx;
 	int error;
 
 	if (cfg) {
@@ -926,6 +947,7 @@ static void goodix_config_cb(const struct firmware *cfg, void *ctx)
 		if (error)
 			goto err_release_cfg;
 	}
+
 	error = goodix_configure_dev(ts);
 	if (error)
 		goto err_release_cfg;
@@ -1000,6 +1022,14 @@ static int goodix_ts_probe(struct i2c_client *client,
 
 	ts->cfg_len = goodix_get_cfg_len(ts->id);
 
+	error = sysfs_create_group(&client->dev.kobj,
+				   &goodix_attr_group);
+	if (error) {
+		dev_err(&client->dev, "Failed to create sysfs group: %d\n",
+			error);
+		return error;
+	}
+
 	if (ts->gpiod_int && ts->gpiod_rst) {
 		error = device_property_read_u32(&ts->client->dev,
 					GOODIX_DEVICE_ESD_TIMEOUT_PROPERTY,
@@ -1008,20 +1038,20 @@ static int goodix_ts_probe(struct i2c_client *client,
 			atomic_set(&ts->esd_timeout, esd_timeout);
 
 		error = sysfs_create_group(&client->dev.kobj,
-					   &goodix_attr_group);
+					   &goodix_gpio_attr_group);
 		if (error) {
 			dev_err(&client->dev,
-				"Failed to create sysfs group: %d\n",
+				"Failed to create gpio sysfs group: %d\n",
 				error);
-			return error;
+			goto err_sysfs_remove_group;
 		}
 
 		/* update device config */
 		ts->cfg_name = devm_kasprintf(&client->dev, GFP_KERNEL,
-					 "goodix_%d_cfg.bin", ts->id);
+					      "goodix_%d_cfg.bin", ts->id);
 		if (!ts->cfg_name) {
 			error = -ENOMEM;
-			goto err_sysfs_remove_group;
+			goto err_sysfs_remove_gpio_group;
 		}
 
 		error = request_firmware_nowait(THIS_MODULE, true, ts->cfg_name,
@@ -1031,20 +1061,23 @@ static int goodix_ts_probe(struct i2c_client *client,
 			dev_err(&client->dev,
 				"Failed to invoke firmware loader: %d\n",
 				error);
-			goto err_free_cfg_name;
+			goto err_sysfs_remove_gpio_group;
 		}
 
 		return 0;
+	} else {
+		error = goodix_configure_dev(ts);
+		if (error)
+			goto err_sysfs_remove_group;
 	}
 
-	return goodix_configure_dev(ts);
+	return 0;
 
-err_free_cfg_name:
+err_sysfs_remove_gpio_group:
 	if (ts->gpiod_int && ts->gpiod_rst)
-		kfree(ts->cfg_name);
+		sysfs_remove_group(&client->dev.kobj, &goodix_gpio_attr_group);
 err_sysfs_remove_group:
-	if (ts->gpiod_int && ts->gpiod_rst)
-		sysfs_remove_group(&client->dev.kobj, &goodix_attr_group);
+	sysfs_remove_group(&client->dev.kobj, &goodix_attr_group);
 	return error;
 }
 
@@ -1052,20 +1085,20 @@ static int goodix_ts_remove(struct i2c_client *client)
 {
 	struct goodix_ts_data *ts = i2c_get_clientdata(client);
 
-	if (!ts->gpiod_int || !ts->gpiod_rst)
-		return 0;
+	if (ts->gpiod_int && ts->gpiod_rst) {
+		wait_for_completion(&ts->firmware_loading_complete);
 
-	wait_for_completion(&ts->firmware_loading_complete);
+		pm_runtime_disable(&client->dev);
+		pm_runtime_set_suspended(&client->dev);
+		pm_runtime_put_noidle(&client->dev);
 
-	pm_runtime_disable(&client->dev);
-	pm_runtime_set_suspended(&client->dev);
-	pm_runtime_put_noidle(&client->dev);
+		sysfs_remove_group(&client->dev.kobj, &goodix_gpio_attr_group);
+		goodix_disable_esd(ts);
+	}
 
 	sysfs_remove_group(&client->dev.kobj, &goodix_attr_group);
-	goodix_disable_esd(ts);
 	if (ACPI_HANDLE(&ts->client->dev))
 		acpi_dev_remove_driver_gpios(ACPI_COMPANION(&ts->client->dev));
-	kfree(ts->cfg_name);
 
 	return 0;
 }
@@ -1088,14 +1121,17 @@ static int __maybe_unused goodix_sleep(struct device *dev)
 		goto out_error;
 
 	goodix_disable_esd(ts);
+
 	/* Free IRQ as IRQ pin is used as output in the suspend sequence */
 	goodix_free_irq(ts);
+
 	/* Output LOW on the INT pin for 5 ms */
 	error = gpiod_direction_output(ts->gpiod_int, 0);
 	if (error) {
 		goodix_request_irq(ts);
 		goto out_error;
 	}
+
 	usleep_range(5000, 6000);
 
 	error = goodix_i2c_write_u8(ts->client, GOODIX_REG_COMMAND,
@@ -1116,6 +1152,7 @@ static int __maybe_unused goodix_sleep(struct device *dev)
 	msleep(58);
 	ts->suspended = true;
 	mutex_unlock(&ts->mutex);
+
 	return 0;
 
 out_error:
@@ -1144,6 +1181,7 @@ static int __maybe_unused goodix_wakeup(struct device *dev)
 	error = gpiod_direction_output(ts->gpiod_int, 1);
 	if (error)
 		goto out_error;
+
 	usleep_range(2000, 5000);
 
 	error = goodix_int_sync(ts);
@@ -1203,6 +1241,7 @@ static const struct of_device_id goodix_of_match[] = {
 	{ .compatible = "goodix,gt911" },
 	{ .compatible = "goodix,gt9110" },
 	{ .compatible = "goodix,gt912" },
+	{ .compatible = "goodix,gt9157" },
 	{ .compatible = "goodix,gt927" },
 	{ .compatible = "goodix,gt9271" },
 	{ .compatible = "goodix,gt928" },
